@@ -1,11 +1,15 @@
 #include "abstractnamespaceitem.h"
 
 #include <QApplication>
+#include <QLocale>
 #include <QMessageBox>
+#include <QSettings>
 #include <QThread>
+#include <QTimer>
 #include <algorithm>
 #include <functional>
 
+#include "app/applog.h"
 #include "connections-tree/keysrendering.h"
 #include "connections-tree/model.h"
 #include "connections-tree/operations.h"
@@ -223,6 +227,14 @@ bool AbstractNamespaceItem::keysShortNameRendering() const {
 void AbstractNamespaceItem::clear() {
   clearLoader();
 
+  /*
+   * Pending "Load all" state is dropped together with the loaded keys.
+   * Note: m_loadAll (the mode flag) is managed by the concrete items.
+   */
+  m_loadAllRendering = false;
+  m_loadAllTotal = 0;
+  m_loadAllRendered = 0;
+
   bool notifyModel = false;
 
   if (m_childItems.size() > 0) {
@@ -273,6 +285,22 @@ void AbstractNamespaceItem::showLoadingError(const QString &err) {
 }
 
 void AbstractNamespaceItem::cancelCurrentOperation() {
+  /*
+   * "Load all" rendering runs in the GUI thread in chunks: it must be stopped
+   * explicitly, otherwise the keys keep coming into the tree after the
+   * connection was reset.
+   */
+  if (m_loadAllRendering) {
+    m_loadAllRendering = false;
+    AppLog::put(
+        QString("LOADALL render canceled type=%1 name=%2 rendered=%3/%4")
+            .arg(type())
+            .arg(getDisplayName())
+            .arg(m_loadAllRendered)
+            .arg(m_loadAllTotal));
+    emit m_model.itemChanged(getSelf());
+  }
+
   if (m_runningOperation) {
     m_runningOperation->future().cancel();
     m_operations->resetConnection();
@@ -415,29 +443,339 @@ void AbstractNamespaceItem::getMemoryUsage(
 }
 
 void AbstractNamespaceItem::fetchMore() {
-  if (m_rawChildKeys.empty()) {
+  /*
+   * 1) Keys which were already received but not rendered yet (rendering
+   *    limit). The whole scan result is kept in m_rawChildKeys, so "Load more"
+   *    is a pure UI operation: no server round-trip at all.
+   */
+  if (!m_rawChildKeys.isEmpty()) {
+    clearLoader();
+
+    int childsCount = m_childItems.size();
+    auto rawKeys = m_rawChildKeys;
+
+    emit m_model.itemChanged(getSelf());
+
+    m_rawChildKeys.clear();
+
+    auto callback = QSharedPointer<RenderRawKeysCallback>(
+        new RenderRawKeysCallback(getSelf(), [this]() {
+          ensureLoaderIsCreated();
+
+          unlock();
+        }));
+
+    return renderRawKeys(
+        rawKeys, m_filter, callback,
+        true, false, static_cast<uint>(childsCount) + keysRenderingLimit());
+  }
+
+  /*
+   * 2) The SCAN session was interrupted (aggregate limit / first screen
+   *    limit). Continue it from the saved cursor - real pagination.
+   */
+  if (m_nextCursor != QByteArray("0")) {
+    loadNextPage();
     return;
   }
 
+  /*
+   * 3) The keyspace was traversed completely - just drop the "Load more"
+   *    pseudo item.
+   */
   clearLoader();
+  emit m_model.itemChanged(getSelf());
+}
 
-  int childsCount = m_childItems.size();
-  auto rawKeys = m_rawChildKeys;
+void AbstractNamespaceItem::showLoadingProgress(long scannedKeys) {
+  if (scannedKeys <= 0) return;
+
+  m_loadingProgress = scannedKeys;
+
+  if (!m_isScanning) return;
+
+  emit m_model.itemChanged(getSelf());
+}
+
+void AbstractNamespaceItem::notifyLoadingProgress(long scannedKeys) {
+  /*
+   * The progress is reported directly from the connection thread, the model
+   * must be touched from the GUI thread only.
+   */
+  QMetaObject::invokeMethod(
+      this, [this, scannedKeys]() { showLoadingProgress(scannedKeys); },
+      Qt::QueuedConnection);
+}
+
+void AbstractNamespaceItem::beginScanProgress(bool loadAll) {
+  m_isScanning = true;
+  m_loadingProgress = 0;
+  m_loadAll = loadAll;
+  m_loadAllDone = false;
+  m_loadAllLoaded = 0;
+}
+
+void AbstractNamespaceItem::endScanProgress() {
+  if (!m_isScanning) return;
+
+  m_isScanning = false;
+  m_loadingProgress = 0;
+  emit m_model.itemChanged(getSelf());
+}
+
+int AbstractNamespaceItem::loadingProgressPercent() const {
+  if (m_loadAllRendering) {
+    if (m_loadAllTotal <= 0) return -1;
+    return qBound(
+        0, static_cast<int>(m_loadAllRendered * 100 / m_loadAllTotal), 100);
+  }
+
+  if (!m_isScanning) return -1;
+
+  const long total = loadingTotalKeys();
+
+  if (total <= 0 || m_loadingProgress <= 0) return -1;
+
+  return qBound(0, static_cast<int>(m_loadingProgress * 100 / total), 100);
+}
+
+bool AbstractNamespaceItem::isLoadingActive() const {
+  return m_isScanning || m_loadAllRendering;
+}
+
+QVariantMap AbstractNamespaceItem::metadata() const {
+  QVariantMap meta = TreeItem::metadata();
+
+  meta["loading_active"] = isLoadingActive();
+  meta["loading_progress"] = loadingProgressPercent();
+
+  return meta;
+}
+
+QString AbstractNamespaceItem::loadingProgressSuffix() const {
+  if (m_loadAllRendering) {
+    const int pct = loadingProgressPercent();
+
+    if (pct >= 0)
+      return QString(" <i>[load all: rendering %1 / %2 - %3%]</i>")
+          .arg(QLocale().toString(static_cast<qlonglong>(m_loadAllRendered)))
+          .arg(QLocale().toString(static_cast<qlonglong>(m_loadAllTotal)))
+          .arg(pct);
+
+    return QString(" <i>[load all: rendering %1 keys]</i>")
+        .arg(QLocale().toString(static_cast<qlonglong>(m_loadAllRendered)));
+  }
+
+  if (m_isScanning) {
+    if (m_loadAll) {
+      const int pct = loadingProgressPercent();
+
+      if (pct >= 0)
+        return QString(" <i>[load all: %1% - %2 keys scanned]</i>")
+            .arg(pct)
+            .arg(QLocale().toString(static_cast<qlonglong>(m_loadingProgress)));
+
+      if (m_loadingProgress > 0)
+        return QString(" <i>[load all: %1 keys scanned]</i>")
+            .arg(QLocale().toString(static_cast<qlonglong>(m_loadingProgress)));
+
+      return QString(" <i>[load all: scanning...]</i>");
+    }
+
+    if (m_loadingProgress <= 0) return QString();
+
+    return QString(" <i>[scanning: %1]</i>")
+        .arg(QLocale().toString(static_cast<qlonglong>(m_loadingProgress)));
+  }
+
+  if (m_loadAllDone && m_loadAllLoaded > 0)
+    return QString(" <i>[all keys: %1]</i>")
+        .arg(QLocale().toString(static_cast<qlonglong>(m_loadAllLoaded)));
+
+  return QString();
+}
+
+void AbstractNamespaceItem::startAutoRender() {
+  if (!m_loadAll || m_loadAllRendering) return;
+
+  if (m_rawChildKeys.isEmpty()) {
+    m_loadAllDone = true;
+    m_loadAllLoaded = static_cast<long>(keysCount());
+    emit m_model.itemChanged(getSelf());
+    return;
+  }
+
+  /*
+   * The keys were sorted by the renderer of the first screen, so the
+   * remaining tail is already in ascending order: the chunks can simply be
+   * appended one after another.
+   */
+  m_loadAllRendering = true;
+  m_loadAllTotal = m_lastPageKeys > 0
+                       ? m_lastPageKeys
+                       : static_cast<long>(keysCount());
+  m_loadAllTotal =
+      qMax(m_loadAllTotal, static_cast<long>(m_rawChildKeys.size()));
+  m_loadAllRendered =
+      qMax(0L, m_loadAllTotal - static_cast<long>(m_rawChildKeys.size()));
+  m_loadAllStalledSteps = 0;
+
+  AppLog::put(QString("LOADALL render start type=%1 name=%2 keys=%3")
+                  .arg(type())
+                  .arg(getDisplayName())
+                  .arg(m_loadAllTotal));
 
   emit m_model.itemChanged(getSelf());
 
-  m_rawChildKeys.clear();
+  autoRenderStep();
+}
 
-  auto callback = QSharedPointer<RenderRawKeysCallback>(
+void AbstractNamespaceItem::autoRenderStep() {
+  if (!m_loadAllRendering) return;
+
+  if (m_rawChildKeys.isEmpty()) {
+    m_loadAllRendering = false;
+    m_loadAllDone = true;
+    m_loadAllLoaded = m_loadAllTotal;
+
+    ensureLoaderIsCreated();
+
+    AppLog::put(QString("LOADALL render done type=%1 name=%2 keys=%3 "
+                        "childs=%4")
+                    .arg(type())
+                    .arg(getDisplayName())
+                    .arg(m_loadAllLoaded)
+                    .arg(m_childItems.size()));
+
+    emit m_model.itemChanged(getSelf());
+    return;
+  }
+
+  QSettings settings;
+  const int chunk = qBound(
+      100, settings.value("app/loadAllRenderChunk", 2000).toInt(), 20000);
+  const int take = qMin(chunk, static_cast<int>(m_rawChildKeys.size()));
+
+  const auto part = m_rawChildKeys.mid(0, take);
+  m_rawChildKeys = m_rawChildKeys.mid(take);
+
+  const long renderedBefore = m_loadAllRendered;
+
+  m_loadAllRendered =
+      qMax(0L, m_loadAllTotal - static_cast<long>(m_rawChildKeys.size()));
+
+  clearLoader();
+
+  /*
+   * The render limit is absolute (amount of child items the renderer may
+   * keep), and the renderer compares it with the recursive child count.
+   */
+  const int renderLimit =
+      static_cast<int>(getAllChilds().size()) + take + 1;
+
+  if (renderedBefore == m_loadAllRendered) {
+    /*
+     * Safety net: the renderer rejected the whole chunk (every key went back
+     * to the raw list). Never loop on it - stop and let the user continue
+     * with the regular "Load more keys" item.
+     */
+    ++m_loadAllStalledSteps;
+
+    if (m_loadAllStalledSteps >= 2) {
+      m_loadAllRendering = false;
+      m_rawChildKeys = part + m_rawChildKeys;
+
+      AppLog::put(QString("LOADALL render stalled type=%1 name=%2 rendered=%3 "
+                          "left=%4 -> stopped")
+                      .arg(type())
+                      .arg(getDisplayName())
+                      .arg(m_loadAllRendered)
+                      .arg(m_rawChildKeys.size()));
+
+      ensureLoaderIsCreated();
+      emit m_model.itemChanged(getSelf());
+      return;
+    }
+  } else {
+    m_loadAllStalledSteps = 0;
+  }
+
+  auto rendered = QSharedPointer<RenderRawKeysCallback>(
       new RenderRawKeysCallback(getSelf(), [this]() {
-        ensureLoaderIsCreated();
+        if (!m_loadAllRendering) return;
 
-        unlock();
+        /*
+         * Repaint the counter between the chunks and give the event loop a
+         * chance to process user input (the tree stays responsive while
+         * hundreds of thousands of keys are being rendered).
+         */
+        emit m_model.itemChanged(getSelf());
+
+        QTimer::singleShot(0, this, [this]() { autoRenderStep(); });
       }));
 
-  return renderRawKeys(
-      rawKeys, m_filter, callback,
-      true, false, static_cast<uint>(childsCount) + keysRenderingLimit());
+  renderRawKeys(part, m_filter, rendered, true, false, renderLimit);
+}
+
+void AbstractNamespaceItem::startProgressWatchdog(
+    int seq, std::function<bool()> isFinished, const QString &logTag) {
+  QSettings settings;
+
+  int timeoutSec = settings.value("app/keysLoadTimeout", 120).toInt();
+
+  if (timeoutSec <= 0) return;
+
+  auto lastSeen = QSharedPointer<long>(new long(m_loadingProgress));
+  auto tick = QSharedPointer<std::function<void()>>::create();
+
+  auto arm = [this, seq, timeoutSec, lastSeen, isFinished, logTag,
+              tick]() {
+    QTimer::singleShot(
+        timeoutSec * 1000, this,
+        [this, seq, timeoutSec, lastSeen, isFinished, logTag, tick]() {
+          if (isFinished()) return;
+
+          /*
+           * Re-arm: the scan is still running and reports progress. "Load all"
+           * on a huge keyspace legitimately takes longer than the timeout,
+           * while a dead connection produces no progress at all.
+           */
+          if (m_loadingProgress != *lastSeen) {
+            *lastSeen = m_loadingProgress;
+
+            AppLog::put(QString("%1 WATCHDOG seq=%2 re-armed (progress=%3)")
+                            .arg(logTag)
+                            .arg(seq)
+                            .arg(m_loadingProgress));
+
+            if (*tick) (*tick)();
+            return;
+          }
+
+          m_loadAllRendering = false;
+          endScanProgress();
+          unlock();
+
+          AppLog::put(
+              QString("%1 WATCHDOG seq=%2 timeout=%3s progress=%4 -> unlocked "
+                      "with error")
+                  .arg(logTag)
+                  .arg(seq)
+                  .arg(timeoutSec)
+                  .arg(m_loadingProgress));
+
+          showLoadingError(QCoreApplication::translate(
+                               "RESP",
+                               "Keys loading timed out (%1s).<br/>"
+                               "Try to reduce the amount of loaded keys "
+                               "(connection settings) or use a more specific "
+                               "keys filter.")
+                               .arg(timeoutSec));
+        });
+  };
+
+  *tick = arm;
+  arm();
 }
 
 void AbstractNamespaceItem::calculateUsedMemory(

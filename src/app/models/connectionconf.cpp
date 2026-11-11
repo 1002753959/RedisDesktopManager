@@ -1,5 +1,7 @@
 #include "connectionconf.h"
 
+#include <QSettings>
+
 ServerConfig::ServerConfig(const QString &host, const QString &auth, const uint port, const QString &name)
     : RedisClient::ConnectionConfig(host, auth, port, name),
       m_owner(QSharedPointer<TreeOperations>())
@@ -15,12 +17,45 @@ ServerConfig::ServerConfig(const QVariantHash &options)
 
 QString ServerConfig::keysPattern() const
 {
-    return param<QString>("keys_pattern", QString(DEFAULT_KEYS_GLOB_PATTERN));
+    /*
+     * Per-connection pattern has a priority. When it is not set or empty
+     * the global default (Settings -> Default keys filter) is used.
+     */
+    QString custom = param<QString>("keys_pattern", QString());
+
+    if (!custom.isEmpty()) return custom;
+
+    QString globalDefault =
+            QSettings().value("app/defaultKeysPattern",
+                              QString(DEFAULT_KEYS_GLOB_PATTERN)).toString();
+
+    return globalDefault.isEmpty() ? QString(DEFAULT_KEYS_GLOB_PATTERN)
+                                   : globalDefault;
 }
 
 void ServerConfig::setKeysPattern(QString keyGlobPattern)
 {
     setParam<QString>("keys_pattern", keyGlobPattern);
+}
+
+qlonglong ServerConfig::keysLoadLimit() const
+{
+    QVariant custom = param<QVariant>("keys_load_limit", QVariant());
+
+    if (custom.isValid() && custom.toLongLong() >= 0)
+        return custom.toLongLong();
+
+    QSettings settings;
+
+    qlonglong globalLimit = settings.value("app/scanLimit",
+                                          DEFAULT_KEYS_LOAD_LIMIT).toLongLong();
+
+    return globalLimit < 0 ? 0 : globalLimit;
+}
+
+void ServerConfig::setKeysLoadLimit(qlonglong limit)
+{
+    setParam<qlonglong>("keys_load_limit", limit);
 }
 
 QString ServerConfig::namespaceSeparator() const

@@ -12,6 +12,7 @@
 class QmlUtils;
 class Events;
 class ConnectionsManager;
+class BookmarksManager;
 class Updater;
 class KeyFactory;
 class TabViewModel;
@@ -62,6 +63,7 @@ class Application : public QApplication {
   QSharedPointer<QmlUtils> m_qmlUtils;
   QSharedPointer<Events> m_events;
   QSharedPointer<ConnectionsManager> m_connections;
+  QSharedPointer<BookmarksManager> m_bookmarks;
   QSharedPointer<KeyFactory> m_keyFactory;
   QSharedPointer<ValueEditor::TabsModel> m_keyValues;
 #ifdef ENABLE_EXTERNAL_FORMATTERS

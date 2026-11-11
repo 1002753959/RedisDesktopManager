@@ -39,7 +39,9 @@
     <file alias="add.svg">images/dark_theme/add.svg</file>
     <file alias="server-stats.svg">images/dark_theme/server-stats.svg</file>
     <file alias="copy.svg">images/dark_theme/copy.svg</file>
+    <file alias="bookmark.svg">images/dark_theme/bookmark.svg</file>
     <file alias="refresh.svg">images/dark_theme/refresh.svg</file>
+    <file alias="load_all.svg">images/dark_theme/load_all.svg</file>
     <file alias="clients.svg">images/dark_theme/clients.svg</file>
     <file alias="wait.svg">images/dark_theme/wait.svg</file>
     <file alias="save.svg">images/dark_theme/save.svg</file>
@@ -99,7 +101,9 @@
     <file alias="add.svg">images/light_theme/add.svg</file>
     <file alias="server-stats.svg">images/light_theme/server-stats.svg</file>
     <file alias="copy.svg">images/light_theme/copy.svg</file>
+    <file alias="bookmark.svg">images/light_theme/bookmark.svg</file>
     <file alias="refresh.svg">images/light_theme/refresh.svg</file>
+    <file alias="load_all.svg">images/light_theme/load_all.svg</file>
     <file alias="clients.svg">images/light_theme/clients.svg</file>
     <file alias="wait.svg">images/light_theme/wait.svg</file>
     <file alias="save.svg">images/light_theme/save.svg</file>

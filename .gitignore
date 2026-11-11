@@ -88,3 +88,13 @@ build-*
 *.xcodeproj
 .xcode
 *qmlcache*
+
+# ---- local build helpers / artifacts (added by local fork) ----
+link_log.txt
+build_log_*.txt
+link.log
+3rdparty/zlib-msvc14-x64*
+3rdparty/qredisclient/.git_upstream_keep
+*.orig
+
+src/resp_resource.rc

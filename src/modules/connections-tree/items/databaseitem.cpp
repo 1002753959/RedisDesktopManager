@@ -1,14 +1,18 @@
 #include "databaseitem.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QFutureWatcher>
 #include <QInputDialog>
 #include <QMenu>
 #include <QMessageBox>
+#include <QSettings>
+#include <QTimer>
 #include <algorithm>
 #include <functional>
 #include <typeinfo>
 
+#include "app/applog.h"
 #include "app/apputils.h"
 #include "connections-tree/model.h"
 #include "connections-tree/utils.h"
@@ -38,6 +42,13 @@ QString DatabaseItem::getDisplayName() const {
 
   QString baseString = QString("db%1").arg(m_dbIndex);
 
+  baseString.append(loadingProgressSuffix());
+
+  if (m_keysTruncated) {
+    baseString.append(QString(" %1").arg(QCoreApplication::translate(
+                                             "RESP", "[limited]")));
+  }
+
   if (m_usedMemory > 0) {
     baseString.append(
         QString(" <b>[%1]</b>").arg(humanReadableSize(m_usedMemory)));
@@ -55,6 +66,16 @@ bool DatabaseItem::isEnabled() const { return true; }
 void DatabaseItem::loadKeys(std::function<void()> callback,
                             bool partialReload) {
   lock();
+
+  const int seq = ++m_loadSeq;
+
+  if (!partialReload) m_keysTruncated = false;
+
+  /*
+   * Reload/live update must not be served from the cached page.
+   */
+  const bool bypassCache = m_bypassCache || partialReload;
+  m_bypassCache = false;
 
   QString filter = (m_filter.isEmpty()) ? "" : m_filter.pattern();
 
@@ -82,10 +103,17 @@ void DatabaseItem::loadKeys(std::function<void()> callback,
             }
           }));
 
+  AppLog::put(QString("DB loadKeys() seq=%1 db=%2 filter=%3 partialReload=%4")
+                  .arg(seq)
+                  .arg(m_dbIndex)
+                  .arg(filter)
+                  .arg(partialReload));
+
   m_operations->getDatabases(dbLoadCallback);
 
   auto onKeysRendered = QSharedPointer<RenderRawKeysCallback>(
-      new RenderRawKeysCallback(getSelf(), [this, callback]() {
+      new RenderRawKeysCallback(getSelf(), [this, callback, seq]() {
+        m_loadFinishedSeq = seq;
         ensureLoaderIsCreated();
         unlock();
 
@@ -99,27 +127,133 @@ void DatabaseItem::loadKeys(std::function<void()> callback,
         if (callback) {
           callback();
         }
+
+        /*
+         * "Load all": the whole keyspace arrived in one page - start rendering
+         * it in background chunks (with progress) instead of asking the user
+         * to click "Load more keys".
+         */
+        if (m_loadAll) startAutoRender();
       }));
 
   auto nsItemsCallback = QSharedPointer<Operations::LoadNamespaceItemsCallback>(
       new Operations::LoadNamespaceItemsCallback(
-          getSelf(), [this, onKeysRendered, partialReload](
-                         const RedisClient::Connection::RawKeysList& keylist,
+          getSelf(), [this, onKeysRendered, partialReload, seq](
+                         const Operations::KeysPage& page,
                          const QString& err) {
+            m_loadFinishedSeq = seq;
+            endScanProgress();
+            m_loadedKeysCount = page.keys.size();
+            m_lastPageKeys = static_cast<long>(page.keys.size());
+
+            AppLog::put(QString("DB keys returned seq=%1 db=%2 keys=%3 next=%4 err=%5")
+                            .arg(seq)
+                            .arg(m_dbIndex)
+                            .arg(page.keys.size())
+                            .arg(QString::fromUtf8(page.nextCursor))
+                            .arg(err.isEmpty() ? QString("<none>") : err));
+
             if (!err.isEmpty()) {
+              m_nextCursor = QByteArray("0");
               unlock();
               return showLoadingError(err);
             }
 
-            return renderRawKeys(keylist, m_filter, onKeysRendered,
-                                 !partialReload, partialReload);
+            /*
+             * Interrupted SCAN session cursor: "Load more keys" continues
+             * the traversal from it (real pagination).
+             */
+            m_nextCursor = page.nextCursor;
+
+            m_keysTruncated = m_loadAll
+                                  ? false
+                                  : (page.nextCursor != QByteArray("0") ||
+                                     isKeysListTruncated(page.keys.size()));
+
+            /*
+             * "Load all" delivers the whole keyspace: only the first screen is
+             * rendered synchronously (the tree has to stay responsive), the
+             * remaining keys are rendered in background chunks afterwards
+             * (startAutoRender / m_rawChildKeys).
+             */
+            int firstScreenLimit = -1;
+
+            if (m_loadAll) {
+              firstScreenLimit = qBound(
+                  200,
+                  QSettings()
+                      .value("app/loadAllFirstScreen", 2000)
+                      .toInt(),
+                  20000);
+            }
+
+            return renderRawKeys(page.keys, m_filter, onKeysRendered,
+                                 !partialReload, partialReload,
+                                 firstScreenLimit);
           }));
 
-  m_operations->loadNamespaceItems(m_dbIndex, filter, nsItemsCallback);
+  Operations::KeysLoadOptions options;
+  /*
+   * Aggregated scan (exact child namespaces counters) for the first screen,
+   * bounded continuation pages for "Load more keys".
+   */
+  /*
+   * Aggregated scan (full traversal, exact counters of every child) is
+   * bandwidth expensive on a big keyspace, so it is opt-in. By default the
+   * first screen is bounded by keysLoadLimit - and when the filter is sparse
+   * the traversal reaches the end of the keyspace anyway, which already
+   * gives exact counters.
+   */
+  options.aggregate = QSettings().value("app/scanAggregate", false).toBool();
+  options.useCache = !bypassCache;
+  options.loadAll = m_loadAll;
+
+  auto selfWPtr = getSelf();
+  options.progress = [this, selfWPtr](long scannedKeys) {
+    if (!selfWPtr.toStrongRef()) return;
+    notifyLoadingProgress(scannedKeys);
+  };
+
+  beginScanProgress(m_loadAll);
+  startLoadWatchdog(seq);
+
+  try {
+    m_operations->loadNamespaceItems(m_dbIndex, filter, nsItemsCallback,
+                                     options);
+  } catch (const RedisClient::Connection::Exception& error) {
+    m_loadFinishedSeq = seq;
+    endScanProgress();
+    unlock();
+    showLoadingError(error.what());
+  }
+}
+
+bool DatabaseItem::isKeysListTruncated(int keysCount) const {
+  qlonglong limit = m_operations->keysLoadLimit();
+
+  return limit > 0 && keysCount >= limit;
+}
+
+void DatabaseItem::startLoadWatchdog(int seq) {
+  startProgressWatchdog(
+      seq, [this, seq]() { return seq != m_loadSeq || m_loadFinishedSeq == seq; },
+      QString("DB[%1]").arg(m_dbIndex));
+}
+
+long DatabaseItem::loadingTotalKeys() const {
+  /*
+   * INFO keyspace is refreshed on every loadKeys(), so the size of the
+   * database is the natural total for the scan percentage. With an active
+   * filter the scan returns a subset, so the percentage is not meaningful
+   * (progress is reported as an amount of scanned keys).
+   */
+  if (!m_filter.isEmpty()) return 0;
+
+  return static_cast<long>(m_keysCount);
 }
 
 QVariantMap DatabaseItem::metadata() const {
-  QVariantMap metadata = TreeItem::metadata();
+  QVariantMap metadata = AbstractNamespaceItem::metadata();
   metadata["filter"] = m_filter.pattern();
   metadata["filterHistory"] = filterHistoryTop10();
   metadata["live_update"] = isLiveUpdateEnabled();
@@ -207,7 +341,15 @@ void DatabaseItem::unload(bool notify) {
 }
 
 void DatabaseItem::reload(std::function<void()> callback) {
+  /*
+   * Regular reload (Ctrl+R / filter change / live update): back to the
+   * bounded first screen.
+   */
+  m_loadAll = false;
+
   clear();
+  m_nextCursor = QByteArray("0");
+  m_bypassCache = true;
   loadKeys([this, callback]() {
     QSettings settings;
     m_model.expandedNamespaces.clear();
@@ -222,6 +364,104 @@ void DatabaseItem::reload(std::function<void()> callback) {
 
     if (callback) callback();
   });
+}
+
+void DatabaseItem::loadAllKeys() {
+  AppLog::put(QString("DB loadAllKeys() db=%1 filter=%2 keysCount=%3")
+                  .arg(m_dbIndex)
+                  .arg(m_filter.pattern())
+                  .arg(m_keysCount));
+
+  /*
+   * Same pipeline as a regular reload, but without any loading limit: the
+   * whole (filtered) keyspace is requested in one page and rendered in
+   * background chunks afterwards.
+   */
+  m_loadAll = true;
+
+  clear();
+  m_nextCursor = QByteArray("0");
+  m_bypassCache = true;
+  loadKeys();
+}
+
+void DatabaseItem::loadNextPage() {
+  const QByteArray startCursor = m_nextCursor;
+
+  if (startCursor == QByteArray("0")) return;
+
+  QString filter = (m_filter.isEmpty()) ? "" : m_filter.pattern();
+
+  AppLog::put(QString("DB loadNextPage db=%1 filter=%2 cursor=%3")
+                  .arg(m_dbIndex)
+                  .arg(filter)
+                  .arg(QString::fromUtf8(startCursor)));
+
+  lock();
+  beginScanProgress();
+
+  Operations::KeysLoadOptions options;
+  /*
+   * Continuation page: bounded scan, aggregation limit is not applied again
+   * (otherwise "Load more" would repeat the whole scan).
+   */
+  options.aggregate = false;
+  options.useCache = true;
+  options.startCursor = startCursor;
+
+  auto selfWPtr = getSelf();
+  options.progress = [this, selfWPtr](long scannedKeys) {
+    if (!selfWPtr.toStrongRef()) return;
+    notifyLoadingProgress(scannedKeys);
+  };
+
+  auto callback = QSharedPointer<Operations::LoadNamespaceItemsCallback>(
+      new Operations::LoadNamespaceItemsCallback(
+          getSelf(), [this, startCursor](const Operations::KeysPage& page,
+                                         const QString& err) {
+            clearLoader();
+            endScanProgress();
+
+            if (!err.isEmpty()) {
+              unlock();
+              return showLoadingError(err);
+            }
+
+            m_nextCursor = page.nextCursor;
+
+            AppLog::put(QString("DB page loaded db=%1 cursor=%2 keys=%3 next=%4")
+                            .arg(m_dbIndex)
+                            .arg(QString::fromUtf8(startCursor))
+                            .arg(page.keys.size())
+                            .arg(QString::fromUtf8(page.nextCursor)));
+
+            if (page.keys.isEmpty()) {
+              ensureLoaderIsCreated();
+              unlock();
+              return emit m_model.itemChanged(getSelf());
+            }
+
+            const int renderLimit = static_cast<int>(m_childItems.size()) +
+                                    static_cast<int>(keysRenderingLimit());
+
+            auto rendered = QSharedPointer<RenderRawKeysCallback>(
+                new RenderRawKeysCallback(getSelf(), [this]() {
+                  ensureLoaderIsCreated();
+                  emit m_model.itemChanged(getSelf());
+                  unlock();
+                }));
+
+            renderRawKeys(page.keys, m_filter, rendered, true, false,
+                          renderLimit);
+          }));
+
+  try {
+    m_operations->loadNamespaceItems(m_dbIndex, filter, callback, options);
+  } catch (const RedisClient::Connection::Exception& error) {
+    endScanProgress();
+    unlock();
+    showLoadingError(error.what());
+  }
 }
 
 void DatabaseItem::performLiveUpdate() {
@@ -318,6 +558,11 @@ QHash<QString, std::function<bool ()> > DatabaseItem::eventHandlers() {
 
   events.insert("reload", [this]() {
     reload();
+    return false;
+  });
+
+  events.insert("load_all", [this]() {
+    loadAllKeys();
     return false;
   });
 

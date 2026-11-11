@@ -68,6 +68,19 @@ class ConnectionsManager : public ConnectionsTree::Model,
 
   void applyGroupChanges() override;
 
+  /*
+   * Bookmark support
+   */
+
+  // Returns {"connection", "db", "pattern", "name", "full_path"} for the
+  // namespace/database/key item under the given index.
+  Q_INVOKABLE QVariantMap bookmarkContext(const QModelIndex& index);
+
+  // Applies the pattern as a database filter and expands matched namespaces.
+  // Returns false when the connection or database is not loaded yet.
+  Q_INVOKABLE bool openKeysPattern(const QString& connection, int dbIndex,
+                                   const QString& pattern);
+
  signals:
   void editConnection(ServerConfig config);
 
@@ -94,6 +107,13 @@ class ConnectionsManager : public ConnectionsTree::Model,
   void addGroup(QSharedPointer<ConnectionsTree::ServerGroup> serverGroup);
 
   void buildConnectionsCache();
+
+  QSharedPointer<ConnectionsTree::ServerItem> findServerItem(
+      const QString& connectionName);
+
+  void expandNamespaceWhenLoaded(
+      QWeakPointer<ConnectionsTree::TreeItem> databaseItem,
+      const QString& namespacePath, const QString& separator);
 
  private:
   QString m_configPath;

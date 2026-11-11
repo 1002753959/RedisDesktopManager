@@ -34,6 +34,7 @@ class ServerConfig : public RedisClient::ConnectionConfig
 
     /* Advanced settings */
     Q_PROPERTY(QString keysPattern READ keysPattern WRITE setKeysPattern)
+    Q_PROPERTY(qlonglong keysLoadLimit READ keysLoadLimit WRITE setKeysLoadLimit)
     Q_PROPERTY(QString namespaceSeparator READ namespaceSeparator WRITE setNamespaceSeparator)
     Q_PROPERTY(uint executeTimeout READ executeTimeout WRITE setExecutionTimeout)
     Q_PROPERTY(uint connectionTimeout READ connectionTimeout WRITE setConnectionTimeout)    
@@ -49,6 +50,14 @@ public:
     static const char DEFAULT_KEYS_GLOB_PATTERN = '*';
     static const bool DEFAULT_LUA_KEYS_LOADING = false;
     static const uint DEFAULT_DB_SCAN_LIMIT = 20;
+    static const qlonglong DEFAULT_KEYS_LOAD_LIMIT = 10000;
+    static const qlonglong DEFAULT_SCAN_MAX_ITERATIONS = 300;
+    /*
+     * Maximum amount of keys scanned by a single aggregated request
+     * (exact child namespaces counters). Bounds the memory footprint and
+     * the server load for huge keyspaces; 0 - unlimited.
+     */
+    static const qlonglong DEFAULT_SCAN_AGGREGATE_LIMIT = 200000;
     static constexpr const char* SSH_SECRET_ID = "ssh_password";
 
 public:
@@ -59,6 +68,13 @@ public:
 
     QString keysPattern() const;
     void setKeysPattern(QString keyGlobPattern);
+
+    /*
+     * Maximum amount of keys loaded per database/namespace (0 - unlimited).
+     * Allows to open huge databases without loading the whole keyspace.
+     */
+    qlonglong keysLoadLimit() const;
+    void setKeysLoadLimit(qlonglong limit);
 
     QString namespaceSeparator() const;
     void setNamespaceSeparator(QString);

@@ -5,14 +5,35 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
+#include <QTimer>
 #include <QUrlQuery>
 
 #include "app/events.h"
 #include "configmanager.h"
 #include "modules/bulk-operations/bulkoperationsmanager.h"
+#include "modules/connections-tree/items/abstractnamespaceitem.h"
+#include "modules/connections-tree/items/databaseitem.h"
+#include "modules/connections-tree/items/namespaceitem.h"
 #include "modules/connections-tree/items/serveritem.h"
 #include "modules/connections-tree/items/servergroup.h"
 #include "modules/value-editor/tabsmodel.h"
+
+using ConnectionsTree::AbstractNamespaceItem;
+using ConnectionsTree::DatabaseItem;
+using ConnectionsTree::ServerItem;
+using ConnectionsTree::TreeItem;
+
+namespace {
+
+QSharedPointer<AbstractNamespaceItem> findChildNamespaceSafe(
+    QSharedPointer<AbstractNamespaceItem> parent, const QString& name) {
+  if (!parent || name.isEmpty()) return QSharedPointer<AbstractNamespaceItem>();
+
+  return parent->findChildNamespace(name.toUtf8());
+}
+
+}  // namespace
 
 ConnectionsManager::ConnectionsManager(const QString& configPath,
                                        QSharedPointer<Events> events)
@@ -456,4 +477,221 @@ void ConnectionsManager::buildConnectionsCache() {
           item.dynamicCast<ConnectionsTree::ServerItem>();
     }
   }
+}
+
+/*
+ * Bookmarks support
+ */
+
+QVariantMap ConnectionsManager::bookmarkContext(const QModelIndex& index) {
+  QVariantMap result;
+
+  TreeItem* rawItem = getItemFromIndex(index);
+
+  if (!rawItem || !m_rawPointers) return result;
+
+  QSharedPointer<TreeItem> item = m_rawPointers->value(rawItem).toStrongRef();
+
+  if (!item) return result;
+
+  QString connection;
+  QString separator(":");
+  int dbIndex = -1;
+
+  QSharedPointer<TreeItem> current = item;
+
+  while (current) {
+    if (dbIndex < 0 && current->type() == "database") {
+      auto namespaceItem = current.dynamicCast<AbstractNamespaceItem>();
+
+      if (namespaceItem) dbIndex = static_cast<int>(namespaceItem->getDbIndex());
+    }
+
+    if (current->type() == "server") {
+      auto server = current.dynamicCast<ServerItem>();
+
+      if (server && server->getOperations()) {
+        connection = server->getOperations()->connectionName();
+        separator = server->getOperations()->getNamespaceSeparator();
+      }
+
+      break;
+    }
+
+    current = current->parent().toStrongRef();
+  }
+
+  if (connection.isEmpty() || dbIndex < 0) return result;
+
+  const QString fullPath = QString::fromUtf8(item->getFullPath());
+
+  QString pattern = fullPath;
+
+  if (item->type() == "namespace") {
+    pattern = fullPath + separator + "*";
+  } else if (item->type() == "database") {
+    pattern = "*";
+  }
+
+  QString name = fullPath;
+
+  if (name.endsWith(separator)) name.chop(separator.size());
+
+  const int pos = name.lastIndexOf(separator);
+
+  if (pos >= 0) name = name.mid(pos + separator.size());
+
+  result["connection"] = connection;
+  result["db"] = dbIndex;
+  result["pattern"] = pattern;
+  result["name"] = name;
+  result["full_path"] = fullPath;
+  result["separator"] = separator;
+
+  return result;
+}
+
+bool ConnectionsManager::openKeysPattern(const QString& connection, int dbIndex,
+                                         const QString& pattern) {
+  auto server = findServerItem(connection);
+
+  if (!server) return false;
+
+  QSharedPointer<DatabaseItem> database;
+
+  for (auto child : server->getAllChilds()) {
+    auto dbItem = child.dynamicCast<DatabaseItem>();
+
+    if (dbItem && static_cast<int>(dbItem->getDbIndex()) == dbIndex) {
+      database = dbItem;
+      break;
+    }
+  }
+
+  if (!database) return false;
+
+  QModelIndex serverIndex =
+      getIndexFromItem(server.staticCast<TreeItem>().toWeakRef());
+
+  if (serverIndex.isValid()) {
+    setExpanded(serverIndex);
+    emit expand(serverIndex);
+  }
+
+  QModelIndex databaseIndex =
+      getIndexFromItem(database.staticCast<TreeItem>().toWeakRef());
+
+  if (!databaseIndex.isValid()) return false;
+
+  setExpanded(databaseIndex);
+  emit expand(databaseIndex);
+
+  setMetadata(databaseIndex, "filter", pattern);
+
+  if (pattern.endsWith('*')) {
+    QString separator = server->getOperations()
+                            ? server->getOperations()->getNamespaceSeparator()
+                            : QString(":");
+
+    QString nsPath = pattern.left(pattern.size() - 1);
+
+    if (nsPath.endsWith(separator)) nsPath.chop(separator.size());
+
+    if (!nsPath.isEmpty() && nsPath != "*") {
+      expandNamespaceWhenLoaded(database.staticCast<TreeItem>().toWeakRef(),
+                                nsPath, separator);
+    }
+  }
+
+  return true;
+}
+
+QSharedPointer<ConnectionsTree::ServerItem> ConnectionsManager::findServerItem(
+    const QString& connectionName) {
+  auto matches = [&connectionName](QSharedPointer<TreeItem> item) {
+    auto server = item.dynamicCast<ConnectionsTree::ServerItem>();
+
+    if (!server) return false;
+
+    if (server->getOperations() &&
+        server->getOperations()->connectionName() == connectionName) {
+      return true;
+    }
+
+    return server->getDisplayName() == connectionName;
+  };
+
+  for (auto item : m_treeItems) {
+    if (item->type() == "server_group") {
+      for (auto srv : item->getAllChilds()) {
+        if (matches(srv)) return srv.dynamicCast<ConnectionsTree::ServerItem>();
+      }
+    } else if (matches(item)) {
+      return item.dynamicCast<ConnectionsTree::ServerItem>();
+    }
+  }
+
+  return QSharedPointer<ConnectionsTree::ServerItem>();
+}
+
+void ConnectionsManager::expandNamespaceWhenLoaded(
+    QWeakPointer<TreeItem> databaseItem, const QString& namespacePath,
+    const QString& separator) {
+  QTimer* timer = new QTimer(this);
+  timer->setInterval(250);
+
+  auto attempts = QSharedPointer<int>::create(0);
+  auto clicked = QSharedPointer<QSet<QByteArray>>::create();
+
+  connect(timer, &QTimer::timeout, this,
+          [this, timer, attempts, clicked, databaseItem, namespacePath,
+           separator]() {
+            ++(*attempts);
+
+            if (*attempts > 120) {
+              timer->stop();
+              timer->deleteLater();
+              return;
+            }
+
+            auto database =
+                databaseItem.toStrongRef().dynamicCast<AbstractNamespaceItem>();
+
+            if (!database) {
+              timer->stop();
+              timer->deleteLater();
+              return;
+            }
+
+            const QStringList segments =
+                namespacePath.split(separator, Qt::SkipEmptyParts);
+
+            QSharedPointer<AbstractNamespaceItem> deepest = database;
+
+            for (const QString& segment : segments) {
+              auto next = findChildNamespaceSafe(deepest, segment);
+
+              if (!next) break;
+
+              deepest = next;
+
+              if (!clicked->contains(deepest->getFullPath())) {
+                QModelIndex index =
+                    getIndexFromItem(deepest.staticCast<TreeItem>().toWeakRef());
+
+                if (index.isValid()) {
+                  clicked->insert(deepest->getFullPath());
+                  sendEvent(index, "click");
+                }
+              }
+            }
+
+            if (deepest != database &&
+                deepest->getFullPath() == namespacePath.toUtf8()) {
+              timer->stop();
+              timer->deleteLater();
+            }
+          });
+
+  timer->start();
 }

@@ -38,6 +38,7 @@
         <file>settings/FontSizeOption.qml</file>
         <file>settings/IntOption.qml</file>
         <file>bulk-operations/BulkOperationsDialog.qml</file>
+    <file>bookmarks/BookmarkPanel.qml</file>
         <file>settings/ComboboxOption.qml</file>
         <file>common/platformutils.js</file>
         <file>common/NewTextArea.qml</file>

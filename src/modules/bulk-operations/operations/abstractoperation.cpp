@@ -39,11 +39,15 @@ void BulkOperations::AbstractOperation::getAffectedKeys(
                                       "RESP", "Cannot connect to redis-server"));
     }
 
+    /*
+     * Bulk operations must cover the whole selected namespace, therefore
+     * keys loading limits are disabled here (0 - unlimited).
+     */
     if (m_connection->mode() == RedisClient::Connection::Mode::Cluster) {
-      m_connection->getClusterKeys(processingCallback, m_keyPattern.pattern());
+      m_connection->getClusterKeys(processingCallback, m_keyPattern.pattern(), 0);
     } else {
       m_connection->getDatabaseKeys(processingCallback, m_keyPattern.pattern(),
-                                    m_dbIndex);
+                                    m_dbIndex, 0, 0);
     }
 
   } catch (const RedisClient::Connection::Exception& e) {

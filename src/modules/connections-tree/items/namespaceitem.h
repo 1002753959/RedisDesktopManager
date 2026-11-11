@@ -31,7 +31,18 @@ class NamespaceItem : public AbstractNamespaceItem {
 
   QVariantMap metadata() const override;
 
+  /*
+   * "Load all" button: reloads the namespace dropping every loading limit.
+   */
+  void loadAllKeys() override;
+
  protected:
+  /*
+   * No server-side total is known for a namespace prefix - the scan progress
+   * is reported as an amount of scanned keys.
+   */
+  long loadingTotalKeys() const override { return 0; }
+
   void load();
 
   void reload();
@@ -39,7 +50,19 @@ class NamespaceItem : public AbstractNamespaceItem {
   QHash<QString, std::function<bool()>> eventHandlers() override;
 
  private:
+  void startLoadWatchdog(int seq);
+
+  bool isKeysListTruncated(int keysCount) const;
+
+  QString buildFilter() const;
+
+  void loadNextPage() override;
+
+ private:
   QByteArray m_fullPath;
   bool m_removed;
+  int m_loadSeq = 0;
+  int m_loadFinishedSeq = -1;
+  bool m_keysTruncated = false;
 };
 }  // namespace ConnectionsTree

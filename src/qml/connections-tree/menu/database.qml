@@ -82,6 +82,9 @@ RowLayout {
                                 "shortcut": "Ctrl+R",
                             },
                             {
+                                'icon': PlatformUtils.getThemeIcon("load_all.svg"), 'event': 'load_all', "help": qsTranslate("RESP","Load all keys (ignore keys loading limit)"),
+                            },
+                            {
                                 'icon': PlatformUtils.getThemeIcon("add.svg"), 'event': 'add_key', "help": qsTranslate("RESP","Add New Key"),
                                 "shortcut": "Ctrl+N",
                             },

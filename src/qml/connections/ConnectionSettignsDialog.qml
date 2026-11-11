@@ -809,6 +809,19 @@ BetterDialog {
                                 onTextChanged: if (root.settings) { root.settings.keysPattern = text }
                             }
 
+                            BetterLabel { text: qsTranslate("RESP","Max loaded keys:") }
+
+                            BetterTextField
+                            {
+                                id: keysLoadLimit
+                                Layout.fillWidth: true
+                                placeholderText: qsTranslate("RESP","Maximum amount of keys loaded from this server (0 - unlimited)")
+                                text: root.settings ? root.settings.keysLoadLimit : ""
+                                validator: IntValidator { bottom: 0; top: 100000000 }
+                                Component.onCompleted: root.items.push(keysLoadLimit)
+                                onTextChanged: if (root.settings) { root.settings.keysLoadLimit = parseInt(text || "0") || 0 }
+                            }
+
                             BetterLabel { text: qsTranslate("RESP","Namespace Separator:") }
 
                             BetterTextField

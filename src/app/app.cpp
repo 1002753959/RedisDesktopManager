@@ -23,6 +23,7 @@
 #include "events.h"
 #include "models/configmanager.h"
 #include "models/connectionconf.h"
+#include "models/bookmarksmanager.h"
 #include "models/connectionsmanager.h"
 #include "models/key-models/keyfactory.h"
 #include "modules/bulk-operations/bulkoperationsmanager.h"
@@ -101,6 +102,8 @@ void Application::initModels() {
 
   m_connections = QSharedPointer<ConnectionsManager>(
       new ConnectionsManager(config, m_events));
+
+  m_bookmarks = QSharedPointer<BookmarksManager>(new BookmarksManager());
 
   m_bulkOperations = QSharedPointer<BulkOperations::Manager>(
       new BulkOperations::Manager(m_connections));
@@ -287,6 +290,8 @@ void Application::registerQmlRootObjects() {
   m_engine.rootContext()->setContextProperty("qmlUtils", m_qmlUtils.data());
   m_engine.rootContext()->setContextProperty("connectionsManager",
                                              m_connections.data());
+  m_engine.rootContext()->setContextProperty("bookmarksManager",
+                                             m_bookmarks.data());
   m_engine.rootContext()->setContextProperty("keyFactory", m_keyFactory.data());
   m_engine.rootContext()->setContextProperty("valuesModel", m_keyValues.data());
 #ifdef ENABLE_EXTERNAL_FORMATTERS

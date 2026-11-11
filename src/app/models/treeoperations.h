@@ -28,8 +28,8 @@ class TreeOperations : public QObject,
 
   void loadNamespaceItems(
       uint dbIndex, const QString& filter,
-      QSharedPointer<LoadNamespaceItemsCallback> callback)
-      override;
+      QSharedPointer<LoadNamespaceItemsCallback> callback,
+      const KeysLoadOptions& options = KeysLoadOptions()) override;
 
   void disconnect() override;
 
@@ -38,6 +38,10 @@ class TreeOperations : public QObject,
   QString getNamespaceSeparator() override;
 
   QString defaultFilter() override;
+
+  qlonglong keysLoadLimit() override;
+
+  qlonglong scanAggregateLimit() override;
 
   QVariantMap getFilterHistory() override;
 
@@ -134,9 +138,40 @@ signals:
       PendingOperation;
   void getReadyConnection(PendingOperation callback);
 
+  /*
+   * Returns a dedicated connection which is used only for keys loading
+   * (scan operations). Prevents the keys scan from blocking the main
+   * connection (and vice versa) on huge databases.
+   */
+  QSharedPointer<RedisClient::Connection> keysLoader(
+      QSharedPointer<RedisClient::Connection> main);
+
+  void resetKeysLoader();
+
+ private:
+  /*
+   * In-memory keys cache: pressing the expand arrow on a namespace twice
+   * (or returning to it after switching tabs) doesn't trigger a new SCAN.
+   * Entries are invalidated on Reload and by TTL.
+   */
+  struct CachedKeysPage {
+    KeysPage page;
+    qint64 timestamp = 0;
+  };
+
+  QString keysCacheKey(uint dbIndex, const QString &filter,
+                       const QByteArray &cursor) const;
+
+  bool lookupKeysCache(const QString &key, KeysPage *page);
+
+  void putKeysCache(const QString &key, const KeysPage &page);
+
+  void invalidateKeysCache(const QString &keyPrefix);
+
  private:
   QSharedPointer<RedisClient::Connection> m_connection;
   QSharedPointer<Events> m_events;
+  QSharedPointer<RedisClient::Connection> m_keysLoader;
   uint m_dbCount;
   RedisClient::Connection::Mode m_connectionMode;
   ServerConfig m_config;
@@ -144,4 +179,6 @@ signals:
   QWeakPointer<ConnectionsTree::ServerItem> m_serverItem;
   QSharedPointer<AsyncFuture::Deferred<void>> m_dbScanOp;
   PendingOperation m_pendingOperation;
+  QHash<QString, CachedKeysPage> m_keysCache;
+  QList<QString> m_keysCacheOrder;
 };

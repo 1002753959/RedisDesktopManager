@@ -219,6 +219,24 @@ BetterDialog {
                         Layout.topMargin: 20
                     }
 
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 30
+
+                        BetterLabel {
+                            text: qsTranslate("RESP","Default keys filter:")
+                            Layout.preferredWidth: 200
+                        }
+
+                        BetterTextField {
+                            id: defaultKeysPatternField
+                            Layout.fillWidth: true
+                            placeholderText: "*"
+                            text: globalSettings.defaultKeysPattern
+                            onTextChanged: globalSettings.defaultKeysPattern = text
+                        }
+                    }
+
                     GridLayout {
                         columns: 2
                         rows: 4
@@ -264,10 +282,24 @@ BetterDialog {
                             Layout.fillWidth: true
                             Layout.preferredHeight: 30
 
-                            min: 1000
-                            max: 500000
+                            min: 0
+                            max: 5000000
                             value: 10000
-                            label: qsTranslate("RESP","Limit for SCAN command")
+                            label: qsTranslate("RESP","Maximum amount of loaded keys (0 - unlimited)")
+                            description: qsTranslate("RESP","Applies to a single database or namespace")
+                        }
+
+                        IntOption {
+                            id: scanMaxIterations
+
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 30
+
+                            min: 0
+                            max: 100000
+                            value: 300
+                            label: qsTranslate("RESP","Maximum amount of SCAN iterations (0 - unlimited)")
+                            description: qsTranslate("RESP","Protects from a full keyspace scan")
                         }
 
                         IntOption {
@@ -359,6 +391,8 @@ BetterDialog {
         property alias useSystemProxy: systemProxy.value
         property alias disableProxyForRedisConnections: disableProxyForRedisConnections.value
         property alias scanLimit: scanCommandLimit.value
+        property alias scanMaxIterations: scanMaxIterations.value
+        property string defaultKeysPattern: "*"
     }
 
     Settings {

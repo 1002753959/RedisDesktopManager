@@ -16,6 +16,7 @@ import "./connections-tree"
 import "./console"
 import "./server-actions"
 import "./bulk-operations"
+import "./bookmarks"
 import "./settings"
 
 ApplicationWindow {
@@ -96,6 +97,50 @@ ApplicationWindow {
     SystemPalette {
         id: disabledSysPalette
         colorGroup: SystemPalette.Disabled
+    }
+
+
+    Rectangle {
+        id: bookmarksFab
+        objectName: "rdm_bookmarks_fab"
+
+        width: 40
+        height: 40
+        radius: 20
+        z: 100
+
+        anchors.left: parent.left
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 16
+        anchors.bottomMargin: 68
+
+        property bool hovered: fabMouseArea.containsMouse
+
+        color: hovered ? "#ffffff" : "#f4f6f9"
+        border.color: hovered ? sysPalette.highlight : "#c8cdd6"
+        border.width: 1
+
+        Image {
+            id: fabIcon
+            anchors.centerIn: parent
+            width: 20
+            height: 20
+            source: "qrc:/images/dark_theme/bookmark.svg"
+        }
+
+        MouseArea {
+            id: fabMouseArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: bookmarksPanel.openNear(bookmarksFab)
+        }
+
+        ToolTip {
+            text: qsTranslate("RESP", "Key Path Bookmarks")
+            visible: bookmarksFab.hovered
+            delay: 500
+        }
     }
 
     QuickStartDialog {
@@ -226,6 +271,11 @@ ApplicationWindow {
         id: bulkOperationDialog
     }
 
+    BookmarkPanel {
+        id: bookmarksPanel
+        objectName: "rdm_bookmarks_panel"
+    }
+
     Connections {
         target: bulkOperations
 
@@ -251,6 +301,17 @@ ApplicationWindow {
         function onExternalFormattersLoaded() {
             valueFormattersModel.loadExternalFormatters();
             valueFormattersModel.updateRWFormatters();
+        }
+    }
+
+    Connections {
+        target: bookmarksManager
+
+        function onMessage(text, isError) {
+            if (isError)
+                notification.showError(text)
+            else
+                notification.showMsg(text)
         }
     }
 
